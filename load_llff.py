@@ -182,6 +182,7 @@ def recenter_poses(poses):
 #####################
 
 
+# TODO: 球面插值生成渲染pose
 def spherify_poses(poses, bds):
     
     p34_to_44 = lambda p : np.concatenate([p, np.tile(np.reshape(np.eye(4)[-1,:], [1,1,4]), [p.shape[0], 1,1])], 1)
@@ -244,15 +245,19 @@ def spherify_poses(poses, bds):
 def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False):
     
 
+    # images shape:[h, w, image_count]
+    # poses shape: [3,5, image_count] 前四列[3,4]子矩阵是pose，最后一列为[h, w, focal]
     poses, bds, imgs = _load_data(basedir, factor=factor) # factor=8 downsamples original imgs by 8x
     print('Loaded', basedir, bds.min(), bds.max())
     
     # Correct rotation matrix ordering and move variable dim to axis 0
+
+    # LLFF coord (x: down, y: right, z: out) -> nerf(opengl) coord: (x: right, y: up, z: out)
     poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
-    poses = np.moveaxis(poses, -1, 0).astype(np.float32)
-    imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)
+    poses = np.moveaxis(poses, -1, 0).astype(np.float32) # [image_count, 3, 5]
+    imgs = np.moveaxis(imgs, -1, 0).astype(np.float32) # [image_count, h, w]
     images = imgs
-    bds = np.moveaxis(bds, -1, 0).astype(np.float32)
+    bds = np.moveaxis(bds, -1, 0).astype(np.float32) # [image_count, 2]
     
     # Rescale if bd_factor is provided
     sc = 1. if bd_factor is None else 1./(bds.min() * bd_factor)

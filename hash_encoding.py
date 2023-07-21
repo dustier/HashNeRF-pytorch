@@ -29,6 +29,7 @@ class HashEmbedder(nn.Module):
             # self.embeddings[i].weight.data.zero_()
         
 
+    # TODO: 三线性插值
     def trilinear_interp(self, x, voxel_min_vertex, voxel_max_vertex, voxel_embedds):
         '''
         x: B x 3
@@ -60,19 +61,29 @@ class HashEmbedder(nn.Module):
         x_embedded_all = []
         for i in range(self.n_levels):
             resolution = torch.floor(self.base_resolution * self.b**i)
+
+            # hashed_voxel_indices shape: [batch_size, 8] 8个顶点的hash索引
+            # keep_mask: x是否在bounding_box中？
+            # voxel_min_vertex, voxel_max_vertex: voxel最大\最小物理坐标
             voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices, keep_mask = get_voxel_vertices(\
                                                 x, self.bounding_box, \
                                                 resolution, self.log2_hashmap_size)
             
+            # 每个level上8个顶点对应的嵌入特征，shape: [batch_size,8,2]
             voxel_embedds = self.embeddings[i](hashed_voxel_indices)
 
+            # 三线性插值 x_embedded shape(maybe): [batch_size, 2]
             x_embedded = self.trilinear_interp(x, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
             x_embedded_all.append(x_embedded)
 
+        # keep_mask [batch_size]: finest res下xyz是否都在bounding_box中
         keep_mask = keep_mask.sum(dim=-1)==keep_mask.shape[-1]
+
+        # 返回的嵌入特征shape: [batch_size, 8*2]
         return torch.cat(x_embedded_all, dim=-1), keep_mask
 
 
+# TODO: 基于球谐函数对光线方向编码
 class SHEncoder(nn.Module):
     def __init__(self, input_dim=3, degree=4):
     

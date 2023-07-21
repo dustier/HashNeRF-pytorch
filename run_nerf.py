@@ -117,7 +117,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
-    sh = rays_d.shape # [..., 3]
+    sh = rays_d.shape # (batch_size, 3)
     if ndc:
         # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
@@ -127,9 +127,9 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    rays = torch.cat([rays_o, rays_d, near, far], -1) # [batch_size, 3+3+1+1]
     if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
+        rays = torch.cat([rays, viewdirs], -1) # [batch_size, 3+3+1+1+3]
 
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
@@ -143,6 +143,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     return ret_list + [ret_dict]
 
 
+# TODO: render
 def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
 
     H, W, focal = hwf
@@ -339,7 +340,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     """
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
-    dists = z_vals[...,1:] - z_vals[...,:-1]
+    dists = z_vals[...,1:] - z_vals[...,:-1] # 相邻采样点之间的间隔 [num_rays, num_samples along the ray - 1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
@@ -358,9 +359,13 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     # sigma_loss = sigma_sparsity_loss(raw[...,3])
     alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
+    # weights shape: [N_rays, N_samples]
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
+    # NOTE: depth_map = weights * 距离
+    #       disp_map = 1 / depth_map
+    #       acc_map = [N_rays] ?
     depth_map = torch.sum(weights * z_vals, -1) / torch.sum(weights, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map)
     acc_map = torch.sum(weights, -1)
@@ -369,6 +374,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         rgb_map = rgb_map + (1.-acc_map[...,None])
 
     # Calculate weights sparsity loss
+    # NOTE: sparsity_loss: loss越大、weights分布随机性越大（可能这条射线上的密度分布比较均匀，不是如真实场景一样 空气、墙壁等密度分明
     try:
         entropy = Categorical(probs = torch.cat([weights, 1.0-weights.sum(-1, keepdim=True)+1e-6], dim=-1)).entropy()
     except:
@@ -425,17 +431,21 @@ def render_rays(ray_batch,
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
-    bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
-    near, far = bounds[...,0], bounds[...,1] # [-1,1]
+    bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2]) # [batch_size, 1, 2]
+    near, far = bounds[...,0], bounds[...,1] # [-1,1] # [batch_size, 1] each
 
     t_vals = torch.linspace(0., 1., steps=N_samples)
+
+    # z = (1 - t) * near + t * far
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
+    # 
     else:
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
     z_vals = z_vals.expand([N_rays, N_samples])
 
+    # jitter or not?
     if perturb > 0.:
         # get intervals between samples
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
@@ -454,6 +464,7 @@ def render_rays(ray_batch,
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
+    # raw shape: [batch_size, 4]
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
@@ -627,6 +638,8 @@ def train():
     # Load data
     K = None
     if args.dataset_type == 'llff':
+        # images shape:[image_count, h, w]
+        # poses shape: [image_count, 3,5] 前四列[3,4]子矩阵是pose，最后一列为[h, w, focal]
         images, poses, bds, render_poses, i_test, bounding_box = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
                                                                   spherify=args.spherify)
@@ -753,6 +766,7 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
+    # grad_vars: model需要训练的参数
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
 
@@ -788,14 +802,14 @@ def train():
             return
 
     # Prepare raybatch tensor if batching random rays
-    N_rand = args.N_rand
-    use_batching = not args.no_batching
+    N_rand = args.N_rand # ray batch size
+    use_batching = not args.no_batching # no_batching: N_rand=1
     if use_batching:
         # For random ray batching
         print('get rays')
-        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) #[batch_size, 2(ro+rd), H, W, 3]
         print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
+        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [batch_size, 3(ro+rd+rgb), H, W, 3]
         rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
         rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
@@ -832,8 +846,11 @@ def train():
         # Sample random ray batch
         if use_batching:
             # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            batch = torch.transpose(batch, 0, 1)
+            batch = rays_rgb[i_batch:i_batch+N_rand] # [Batch, 2+1, 3]
+            batch = torch.transpose(batch, 0, 1) # [3, Batch, 3]
+
+            # batch_rays: 光线原点、光线方向
+            # target_s: 与光线对应的像素颜色
             batch_rays, target_s = batch[:2], batch[2]
 
             i_batch += N_rand
